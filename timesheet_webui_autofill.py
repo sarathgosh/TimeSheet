@@ -1,12 +1,12 @@
 
-# timesheet_webui_autofill_v3.py
+# timesheet_webui_autofill_v3_fixed.py
 # Streamlit Web UI — ZC-030 Remote Engineer Timesheet
-# Robust NEW-ROW auto-fill using hidden Row IDs (works for both sidebar append + editor "Add row").
+# Fix: robust detect_new_ids without using "or []" on Series.
 
 import io
 import uuid
 from datetime import time, date, datetime, timedelta
-from typing import Tuple, Optional, Dict, List
+from typing import Optional, Dict, List
 
 import pandas as pd
 import streamlit as st
@@ -89,7 +89,7 @@ def hhmm_or_blank(t) -> str:
         return s
     return ""
 
-def to_time_obj(s: str) -> Optional[time]:
+def to_time_obj(s: str):
     s = (s or "").strip()
     if not s:
         return None
@@ -117,7 +117,7 @@ def calc_row_hours(start_str: str, end_str: str, break_str: str) -> float:
     break_hours = parse_break_to_hours(break_str)
     return round(max(0.0, (work_minutes/60.0) - break_hours), 2)
 
-def str_to_date(d: str) -> Optional[date]:
+def str_to_date(d: str):
     s = (d or "").strip()
     if not s: return None
     for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%Y/%m/%d"):
@@ -142,7 +142,6 @@ def ensure_row_ids(df: pd.DataFrame) -> pd.DataFrame:
     if "Row ID" not in df.columns:
         df.insert(0, "Row ID", [str(uuid.uuid4()) for _ in range(len(df))])
     else:
-        # Fill missing IDs (new editor rows)
         df["Row ID"] = df["Row ID"].apply(lambda x: str(x) if isinstance(x, str) and x.strip() else str(uuid.uuid4()))
     return df
 
@@ -216,14 +215,12 @@ def export_to_excel(employee: dict, table: pd.DataFrame) -> bytes:
         for col, h in enumerate(headers):
             ws.write(12, col, h, header_fmt)
 
-        # Drop Row ID before export
         exp = table.copy()
         if "Row ID" in exp.columns:
             exp = exp.drop(columns=["Row ID"])
         if exp.empty:
             exp = pd.DataFrame(columns=headers)
 
-        # Ensure all columns exist
         for h in headers:
             if h not in exp.columns:
                 exp[h] = ""
@@ -251,11 +248,6 @@ def export_to_excel(employee: dict, table: pd.DataFrame) -> bytes:
         ws.merge_range(total_row + 2, 3, total_row + 2, 4, "RM signature", box)
         ws.merge_range(total_row + 2, 5, total_row + 2, 6, "Date", box)
 
-        readme = wb.add_worksheet("ReadMe")
-        readme.write(0,0,"How to use")
-        readme.write(1,0,"1) Employee Name can auto-fill details using a master CSV.")
-        readme.write(2,0,"2) Add rows — new rows auto-fill Date/Day/Start/End.")
-        readme.write(3,0,"3) Export to Excel.")
     output.seek(0)
     return output.read()
 
@@ -277,12 +269,16 @@ def recalc_hours(df: pd.DataFrame):
 # ------------------------------ Autofill new rows (ID-based) ------------------------------
 
 def detect_new_ids(old_df: pd.DataFrame, new_df: pd.DataFrame) -> List[str]:
-    old_ids = set((old_df.get("Row ID") or []).tolist()) if "Row ID" in old_df.columns else set()
-    new_ids = set((new_df.get("Row ID") or []).tolist()) if "Row ID" in new_df.columns else set()
+    """Return list of Row IDs that are present in new_df but not in old_df."""
+    if old_df is None or new_df is None:
+        return []
+    old_ids = set(old_df["Row ID"].tolist()) if "Row ID" in old_df.columns else set()
+    new_ids = set(new_df["Row ID"].tolist()) if "Row ID" in new_df.columns else set()
     return [rid for rid in new_ids if rid not in old_ids]
 
 def get_last_non_empty_date(df: pd.DataFrame) -> Optional[date]:
-    if "Date" not in df.columns: return None
+    if df is None or "Date" not in df.columns:
+        return None
     for v in reversed(df["Date"].tolist()):
         dv = str_to_date(str(v))
         if dv: return dv
@@ -291,15 +287,12 @@ def get_last_non_empty_date(df: pd.DataFrame) -> Optional[date]:
 def autofill_rows_by_ids(df: pd.DataFrame, id_list: List[str]) -> pd.DataFrame:
     if not id_list: return df
     df = df.copy()
-    # Determine base date from rows that are NOT new
     non_new = df[~df["Row ID"].isin(id_list)]
     ref_date = get_last_non_empty_date(non_new) or date.today()
     cur = ref_date
     for idx, rid in enumerate(id_list):
         rmask = df["Row ID"] == rid
-        # first new row uses ref_date; subsequent +1 day
         cur = (ref_date if idx == 0 else cur + timedelta(days=1))
-        # apply only if blank
         if df.loc[rmask, "Date"].astype(str).str.strip().eq("").all():
             df.loc[rmask, "Date"] = date_to_str(cur)
         if df.loc[rmask, "Day"].astype(str).str.strip().eq("").all():
@@ -312,10 +305,10 @@ def autofill_rows_by_ids(df: pd.DataFrame, id_list: List[str]) -> pd.DataFrame:
 
 # ------------------------------ App ------------------------------
 
-st.set_page_config(page_title="ZC-030 Timesheet (Auto-Fill v3)", page_icon="🗓️", layout="wide")
+st.set_page_config(page_title="ZC-030 Timesheet (Auto-Fill v3 Fixed)", page_icon="🗓️", layout="wide")
 init_session()
 
-st.title("🗓️ ZC-030 Remote Engineer Timesheet — Auto-Fill v3")
+st.title("🗓️ ZC-030 Remote Engineer Timesheet — Auto-Fill v3 (Fixed)")
 
 with st.sidebar:
     st.header("👥 Employee Master")
@@ -334,13 +327,13 @@ with st.sidebar:
     st.subheader("Rows")
     add_rows = st.number_input("Add rows", min_value=1, max_value=100, value=5, step=1)
     if st.button("➕ Append Rows"):
-        before_df = st.session_state.table.copy()
+        before_df = ensure_row_ids(st.session_state.table.copy())
         extra = pd.DataFrame({c: [""]*add_rows for c in BASE_COLUMNS})
         extra = ensure_row_ids(extra)
-        st.session_state.table = pd.concat([ensure_row_ids(before_df), extra], ignore_index=True)
-        # mark new ids
-        new_ids = detect_new_ids(before_df, st.session_state.table)
-        st.session_state.table = autofill_rows_by_ids(st.session_state.table, new_ids)
+        after_df = pd.concat([before_df, extra], ignore_index=True)
+        new_ids = detect_new_ids(before_df, after_df)
+        after_df = autofill_rows_by_ids(after_df, new_ids)
+        st.session_state.table = after_df
 
     st.divider()
     st.header("📦 Export")
@@ -387,9 +380,7 @@ st.divider()
 # ------------------------------ Work Log ------------------------------
 
 st.subheader("🧾 Work Log")
-base = ensure_row_ids(st.session_state.table)
-
-# Keep a copy of old IDs to detect new ones after editing
+base = ensure_row_ids(st.session_state.table.copy())
 old_df = base.copy()
 
 cfg = {
@@ -409,31 +400,25 @@ edited = st.data_editor(
     use_container_width=True,
     hide_index=True,
     column_config=cfg,
-    column_order=[c for c in BASE_COLUMNS if c != "Row ID"] + ["Row ID"],  # keep ID but push to end
+    column_order=["Date","Day","Start Time","End Time","Break (hh:mm)","Work Hours","Description of Work","Row ID"],
     key="data_editor",
 )
 
-# Ensure Row IDs exist for any newly added editor rows
 edited = ensure_row_ids(edited)
-
-# Detect brand-new rows by Row ID
 new_ids = detect_new_ids(old_df, edited)
-
-# Autofill only those new rows
 if new_ids:
     edited = autofill_rows_by_ids(edited, new_ids)
 
-# Derive Day from Date if Day blank (for all rows; does not overwrite non-blank)
+# Derive Day from Date if Day blank (non-destructive)
 for i, row in edited.iterrows():
     if not str(row.get("Day","")).strip():
         dval = str_to_date(str(row.get("Date","")))
         if dval:
             edited.at[i, "Day"] = weekday_abbr(dval)
 
-# Recalc hours and persist
 calc_df, total = recalc_hours(edited)
 st.session_state.table = calc_df
 st.session_state.total_hours = total
 
 st.info(f"**Total Hours:** {total:.2f}")
-st.caption("Add rows via the sidebar or the grid ➜ new rows auto-fill Date/Day/Start/End. Existing values are never overwritten.")
+st.caption("Add rows ➜ new rows auto-fill Date/Day/Start/End. Existing values are never overwritten.")
