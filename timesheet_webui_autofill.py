@@ -1,11 +1,14 @@
 
-# timesheet_webui_autofill.py
+# timesheet_webui_autofill_v2.py
 # Streamlit Web UI — ZC-030 Remote Engineer Timesheet
-# New feature: Auto-fill details (IC#, Department, Job Title, Reporting Manager)
-# when "Employee Name" matches a master directory (CSV upload or built-in sample).
+# Features:
+# - Employee master auto-fill (IC#, Department, Job Title, RM)
+# - NEW: Auto-fill on new rows only -> Date, Day, Start Time, End Time
+#        * Triggered when you append rows via sidebar or add rows inside the editor
+#        * Defaults: Date today for first new row (or last date + 1), Day from Date, Start 09:00, End 18:00
 
 import io
-from datetime import time
+from datetime import time, date, datetime, timedelta
 from typing import Tuple, Optional, Dict
 
 import pandas as pd
@@ -14,7 +17,6 @@ import streamlit as st
 # ------------------------------ Master Directory Helpers ------------------------------
 
 BUILTIN_EMPLOYEES = [
-    # Edit or replace with your real people
     {"Employee Name": "Sarath Gosh", "IC#": "S1234567A", "Department": "Engineering", "Job Title": "Remote Engineer", "Reporting Manager": "Shailesh"},
     {"Employee Name": "Shri Shailesh", "IC#": "S7654321B", "Department": "Operations", "Job Title": "Manager", "Reporting Manager": "—"},
 ]
@@ -22,7 +24,6 @@ BUILTIN_EMPLOYEES = [
 REQUIRED_COLS = ["Employee Name", "IC#", "Department", "Job Title", "Reporting Manager"]
 
 def normalize_master(df: pd.DataFrame) -> pd.DataFrame:
-    """Make column names flexible; return only needed columns with exact names."""
     colmap = {}
     for c in df.columns:
         lc = str(c).strip().lower()
@@ -41,9 +42,7 @@ def normalize_master(df: pd.DataFrame) -> pd.DataFrame:
         if r not in df2.columns:
             df2[r] = ""
     df2 = df2[REQUIRED_COLS].copy()
-    # Drop empty names
     df2 = df2[df2["Employee Name"].astype(str).str.strip() != ""]
-    # Keep last occurrence when duplicates exist
     df2 = df2.drop_duplicates(subset=["Employee Name"], keep="last").reset_index(drop=True)
     return df2
 
@@ -67,12 +66,10 @@ def parse_break_to_hours(break_str: str) -> float:
     if not isinstance(break_str, str):
         return 0.0
     s = break_str.strip()
-    if not s:
-        return 0.0
+    if not s: return 0.0
     try:
         parts = s.split(":")
-        if len(parts) != 2:
-            return 0.0
+        if len(parts) != 2: return 0.0
         h = int(parts[0]); m = int(parts[1])
         return max(0.0, float(h) + float(m)/60.0)
     except Exception:
@@ -126,14 +123,8 @@ def calc_row_hours(start_str: str, end_str: str, break_str: str) -> float:
 def init_session():
     if "employee" not in st.session_state:
         st.session_state.employee = {
-            "Employee Name": "",
-            "IC#": "",
-            "Department": "",
-            "Job Title": "",
-            "Reporting Manager": "",
-            "Review Month": "",
-            "Year": "",
-            "Date": "",
+            "Employee Name": "", "IC#": "", "Department": "", "Job Title": "",
+            "Reporting Manager": "", "Review Month": "", "Year": "", "Date": "",
         }
     if "table" not in st.session_state:
         st.session_state.table = pd.DataFrame({
@@ -153,6 +144,8 @@ def init_session():
         st.session_state.employee_master_dict = master_to_dict(st.session_state.employee_master)
     if "last_emp_name" not in st.session_state:
         st.session_state.last_emp_name = ""
+    if "last_len" not in st.session_state:
+        st.session_state.last_len = len(st.session_state.table)
 
 def recalc_hours(df: pd.DataFrame):
     df = df.copy()
@@ -167,98 +160,70 @@ def recalc_hours(df: pd.DataFrame):
         total += hrs
     return df, round(total, 2)
 
-def export_to_excel(employee: dict, table: pd.DataFrame) -> bytes:
-    output = io.BytesIO()
-    with pd.ExcelWriter(output, engine="xlsxwriter", datetime_format="hh:mm", date_format="yyyy-mm-dd") as writer:
-        sheet_name = "Timesheet"
-        wb  = writer.book
-        ws  = wb.add_worksheet(sheet_name)
+# ------------------------------ Auto-fill for NEW rows only ------------------------------
 
-        title_fmt = wb.add_format({"bold": True, "font_size": 16, "align": "center", "valign": "vcenter"})
-        subtitle_fmt = wb.add_format({"bold": True, "font_size": 14, "align": "center"})
-        sub_fmt   = wb.add_format({"bold": True, "font_size": 10})
-        box_fmt   = wb.add_format({"border": 1, "valign": "vcenter"})
-        label_fmt = wb.add_format({"bold": True})
-        right_fmt = wb.add_format({"align": "right"})
-        header_fmt = wb.add_format({"bold": True, "bg_color": "#E6F3FF", "border": 1, "align": "center"})
-        num_fmt = wb.add_format({"num_format": "0.00", "border": 1})
-        time_fmt = wb.add_format({"num_format": "hh:mm", "border": 1})
-        box = wb.add_format({"border": 1})
+def str_to_date(d: str) -> Optional[date]:
+    s = (d or "").strip()
+    if not s: return None
+    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d/%m/%Y", "%Y/%m/%d"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except Exception:
+            continue
+    return None
 
-        ws.set_column("A:A", 12)
-        ws.set_column("B:B", 10)
-        ws.set_column("C:D", 12)
-        ws.set_column("E:E", 13)
-        ws.set_column("F:F", 12)
-        ws.set_column("G:G", 60)
+def date_to_str(d: date) -> str:
+    return d.strftime("%Y-%m-%d")
 
-        ws.merge_range("A1:G1", "ZEALCORPS PTE LTD", title_fmt)
-        ws.merge_range("A2:G2", "REMOTE ENGINEER TIMESHEET", subtitle_fmt)
-        ws.write("A3", "Form No: ZC-030", sub_fmt)
-        ws.write("B3", "Rev. No: 00", sub_fmt)
+def weekday_abbr(d: date) -> str:
+    return DAYS[d.weekday()]  # 0=Mon
 
-        ws.merge_range("A5:G5", "Employee Information", wb.add_format({"bold": True, "bg_color": "#F2F2F2", "border": 1}))
-        ws.write("A6", "Employee Name:", label_fmt); ws.merge_range("B6:D6", employee.get("Employee Name",""), box_fmt)
-        ws.write("E6", "IC#:", label_fmt);           ws.merge_range("F6:G6", employee.get("IC#",""), box_fmt)
-        ws.write("A7", "Department:", label_fmt);    ws.merge_range("B7:D7", employee.get("Department",""), box_fmt)
-        ws.write("E7", "Job Title:", label_fmt);     ws.merge_range("F7:G7", employee.get("Job Title",""), box_fmt)
-        ws.write("A8", "Review Month:", label_fmt);  ws.merge_range("B8:D8", employee.get("Review Month",""), box_fmt)
-        ws.write("E8", "Year:", label_fmt);          ws.merge_range("F8:G8", employee.get("Year",""), box_fmt)
-        ws.write("A9", "Date:", label_fmt);          ws.merge_range("B9:D9", employee.get("Date",""), box_fmt)
-        ws.write("E9", "Reporting Manager:", label_fmt); ws.merge_range("F9:G9", employee.get("Reporting Manager",""), box_fmt)
+def next_date(prev: Optional[date]) -> date:
+    return (prev + timedelta(days=1)) if prev else date.today()
 
-        headers = ["Date", "Day", "Start Time", "End Time", "Break (hh:mm)", "Work Hours", "Description of Work"]
-        for col, h in enumerate(headers):
-            ws.write(12, col, h, header_fmt)
+def get_last_non_empty_date(df: pd.DataFrame) -> Optional[date]:
+    if "Date" not in df.columns: return None
+    for v in reversed(df["Date"].tolist()):
+        dv = str_to_date(str(v))
+        if dv: return dv
+    return None
 
-        if table is None or table.empty:
-            table = pd.DataFrame(columns=headers)
+def autofill_new_rows(df: pd.DataFrame, old_len: int) -> pd.DataFrame:
+    """Fill Date, Day, Start Time, End Time for rows added beyond old_len ONLY if blank."""
+    if df is None or df.empty: return df
+    df = df.copy()
+    new_len = len(df)
+    if new_len <= old_len:  # nothing added
+        return df
 
-        for h in headers:
-            if h not in table.columns:
-                table[h] = ""
+    # Determine starting reference date
+    ref_date = get_last_non_empty_date(df.iloc[:old_len]) or date.today()
+    cur = ref_date
 
-        start_row = 13
-        for i, (_, row) in enumerate(table.iterrows()):
-            r = start_row + i
-            ws.write(r, 0, row.get("Date", ""), box)
-            ws.write(r, 1, row.get("Day", ""), box)
-            ws.write(r, 2, hhmm_or_blank(row.get("Start Time","")), time_fmt)
-            ws.write(r, 3, hhmm_or_blank(row.get("End Time","")), time_fmt)
-            ws.write(r, 4, str(row.get("Break (hh:mm)","")), box)
-            try:
-                wh = float(row.get("Work Hours", 0.0) or 0.0)
-            except Exception:
-                wh = 0.0
-            ws.write(r, 5, wh, num_fmt)
-            ws.write(r, 6, row.get("Description of Work",""), box)
-
-        total_row = start_row + len(table)
-        ws.write(total_row, 4, "Total Hours:", right_fmt)
-        ws.write_formula(total_row, 5, f"=SUM(F{start_row+1}:F{start_row+len(table)})", num_fmt)
-
-        ws.merge_range(total_row + 2, 0, total_row + 2, 2, "Emp Signature", box)
-        ws.merge_range(total_row + 2, 3, total_row + 2, 4, "RM signature", box)
-        ws.merge_range(total_row + 2, 5, total_row + 2, 6, "Date", box)
-
-        readme = wb.add_worksheet("ReadMe")
-        readme.write(0,0,"How to use")
-        readme.write(1,0,"1) Fill Employee Information. Name can auto-fill from master.")
-        readme.write(2,0,"2) Enter Date, Day (dropdown), Start/End, Break. Work Hours auto-calc in app.")
-        readme.write(3,0,"3) Export to Excel for sharing.")
-        readme.write(5,0,"Master Directory")
-        readme.write(6,0,"- Upload a CSV with columns: Employee Name, IC#, Department, Job Title, Reporting Manager.")
-        readme.write(7,0,"- Or add current employee to master via sidebar button.")
-
-    output.seek(0)
-    return output.read()
+    for i in range(old_len, new_len):
+        row = df.iloc[i]
+        # Only fill if cell is blank
+        if not str(row.get("Date", "")).strip():
+            cur = next_date(cur) if i > old_len else cur  # first new row uses ref_date; subsequent rows +1
+            df.at[i, "Date"] = date_to_str(cur)
+        # Day from Date (if day blank)
+        if not str(row.get("Day", "")).strip():
+            dval = str_to_date(str(df.at[i, "Date"]))
+            if dval:
+                df.at[i, "Day"] = weekday_abbr(dval)
+        # Start/End default
+        if not str(row.get("Start Time", "")).strip():
+            df.at[i, "Start Time"] = "09:00"
+        if not str(row.get("End Time", "")).strip():
+            df.at[i, "End Time"] = "18:00"
+    return df
 
 # ------------------------------ App ------------------------------
 
-st.set_page_config(page_title="ZC-030 Timesheet (Auto-Fill)", page_icon="🗓️", layout="wide")
+st.set_page_config(page_title="ZC-030 Timesheet (Auto-Fill v2)", page_icon="🗓️", layout="wide")
 init_session()
 
-st.title("🗓️ ZC-030 Remote Engineer Timesheet — Auto-Fill Edition")
+st.title("🗓️ ZC-030 Remote Engineer Timesheet — Auto-Fill v2 (New Rows Only)")
 
 with st.sidebar:
     st.header("👥 Employee Master")
@@ -273,35 +238,20 @@ with st.sidebar:
         except Exception as e:
             st.error(f"Failed to parse CSV: {e}")
 
-    st.caption("CSV columns can be flexible; we'll map to: Employee Name, IC#, Department, Job Title, Reporting Manager.")
-
     st.divider()
-    st.subheader("Auto-Fill Settings")
-    auto_fill = st.checkbox("Auto-fill when Employee Name matches", value=True)
-    overwrite = st.checkbox("Overwrite existing fields on match", value=False)
+    st.subheader("Rows")
+    add_rows = st.number_input("Add rows", min_value=1, max_value=100, value=5, step=1)
+    if st.button("➕ Append Rows"):
+        # Append blank rows then auto-fill ONLY the appended section.
+        before = len(st.session_state.table)
+        extra = pd.DataFrame({c: [""]*add_rows for c in st.session_state.table.columns})
+        st.session_state.table = pd.concat([st.session_state.table, extra], ignore_index=True)
+        st.session_state.table = autofill_new_rows(st.session_state.table, before)
+        st.session_state.last_len = len(st.session_state.table)
 
-    st.divider()
-    if st.button("➕ Add current form to Master"):
-        cur = st.session_state.employee
-        if cur["Employee Name"].strip():
-            # append or replace
-            df = st.session_state.employee_master.copy()
-            row = {c: cur.get(c, "") for c in REQUIRED_COLS}
-            # Replace any existing entry with same name
-            df = df[df["Employee Name"] != row["Employee Name"]]
-            df = pd.concat([df, pd.DataFrame([row])], ignore_index=True)
-            st.session_state.employee_master = df
-            st.session_state.employee_master_dict = master_to_dict(df)
-            st.success(f"Saved '{row['Employee Name']}' to master.")
-        else:
-            st.warning("Please enter Employee Name first.")
-
-    st.download_button(
-        "⬇️ Download Master (CSV)",
-        data=st.session_state.employee_master.to_csv(index=False).encode("utf-8"),
-        file_name="employee_master.csv",
-        mime="text/csv"
-    )
+    if st.button("🧹 Clear All Rows"):
+        st.session_state.table = st.session_state.table.iloc[0:0].copy()
+        st.session_state.last_len = 0
 
     st.divider()
     st.header("📦 Export")
@@ -318,21 +268,22 @@ with st.sidebar:
 # ------------------------------ Employee Form ------------------------------
 
 st.subheader("👤 Employee Information")
-
-# Suggest names from master while allowing free typing
+# Suggest names from master
 name_options = [""] + sorted(list(st.session_state.employee_master_dict.keys()))
 c1, c2 = st.columns([2,1])
 emp_name_input = c1.selectbox("Employee Name (type to search)", options=name_options, index=name_options.index(st.session_state.employee.get("Employee Name","")) if st.session_state.employee.get("Employee Name","") in name_options else 0)
 manual_name = c2.text_input("Or type a new name", value="" if emp_name_input else st.session_state.employee.get("Employee Name",""))
-
 final_name = manual_name.strip() if manual_name.strip() else emp_name_input.strip()
+
+# Auto-fill from master on name change
+if "employee_master_dict" not in st.session_state:
+    st.session_state.employee_master_dict = {}
 if final_name != st.session_state.last_emp_name:
-    # Name changed
     st.session_state.employee["Employee Name"] = final_name
-    if auto_fill and final_name in st.session_state.employee_master_dict:
+    if final_name in st.session_state.employee_master_dict:
         master = st.session_state.employee_master_dict[final_name]
         for k,v in master.items():
-            if overwrite or not st.session_state.employee.get(k, "").strip():
+            if not st.session_state.employee.get(k, "").strip():
                 st.session_state.employee[k] = v
     st.session_state.last_emp_name = final_name
 
@@ -346,7 +297,7 @@ col5, col6, col7, col8 = st.columns(4)
 st.session_state.employee["Review Month"] = col5.text_input("Review Month", st.session_state.employee.get("Review Month",""))
 st.session_state.employee["Year"] = col6.text_input("Year", st.session_state.employee.get("Year",""))
 st.session_state.employee["Date"] = col7.text_input("Date", st.session_state.employee.get("Date",""), placeholder="YYYY-MM-DD")
-st.caption("Tip: Upload a master CSV once; picking a name will populate IC#, Department, Job Title, Reporting Manager automatically.")
+st.caption("Auto-fill: picking a name fills IC#/Dept/Title/RM. New rows auto-fill Date/Day/Start/End only.")
 
 st.divider()
 
@@ -354,6 +305,9 @@ st.divider()
 
 st.subheader("🧾 Work Log")
 edit_df = st.session_state.table.copy()
+
+# If user adds rows directly via data_editor's built-in UI, detect length increase and auto-fill new tail only.
+pre_len = st.session_state.last_len
 
 try:
     cfg = {
@@ -377,9 +331,16 @@ edited = st.data_editor(
     key="data_editor",
 )
 
+# If editor grew in length, auto-fill new tail
+post_len = len(edited)
+if post_len > pre_len:
+    edited = autofill_new_rows(edited, pre_len)
+
+# Recalc hours and persist
 calc_df, total = recalc_hours(edited)
 st.session_state.table = calc_df
 st.session_state.total_hours = total
+st.session_state.last_len = len(calc_df)
 
 st.info(f"**Total Hours:** {total:.2f}")
-st.caption("Times can be '9:30' or '0930'. Break as 'HH:MM' (e.g., 00:30). Midnight crossover supported.")
+st.caption("New rows get default Date/Day/Start/End. Existing values are never overwritten.")
